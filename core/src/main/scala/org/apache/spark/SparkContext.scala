@@ -431,6 +431,17 @@ class SparkContext(config: SparkConf) extends Logging {
 
   initDriverMetrics()
 
+  private[spark] var dynamicVariable: Any = null
+
+  /**
+   * Sets the value of a "dynamic variable". This value is made available to jobs
+   * without having to be passed around explicitly. During execution of a Spark job
+   * this value can be obtained from the [[SparkDynamic]] object.
+   */
+  def setDynamicVariableValue(value: Any) {
+    dynamicVariable = value
+  }
+
   // Methods for creating RDDs
 
   /** Distribute a local Scala collection to form an RDD.

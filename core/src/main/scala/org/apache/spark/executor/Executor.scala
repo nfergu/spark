@@ -30,6 +30,7 @@ import org.apache.spark.scheduler._
 import org.apache.spark.shuffle.FetchFailedException
 import org.apache.spark.storage.{StorageLevel, TaskResultBlockId}
 import org.apache.spark.util.{AkkaUtils, Utils}
+import org.apache.spark.serializer.SerializerInstance
 
 /**
  * Spark executor used with Mesos, YARN, and the standalone scheduler.
@@ -164,68 +165,78 @@ private[spark] class Executor(
       try {
         SparkEnv.set(env)
         Accumulators.clear()
-        val (taskFiles, taskJars, taskBytes) = Task.deserializeWithDependencies(serializedTask)
+        val (taskFiles, taskJars, remainingBytes) = Task.deserializeWithDependencies(serializedTask)
         updateDependencies(taskFiles, taskJars)
-        task = ser.deserialize[Task[Any]](taskBytes, Thread.currentThread.getContextClassLoader)
 
-        // If this task has been killed before we deserialized it, let's quit now. Otherwise,
-        // continue executing the task.
-        if (killed) {
-          // Throw an exception rather than returning, because returning within a try{} block
-          // causes a NonLocalReturnControl exception to be thrown. The NonLocalReturnControl
-          // exception will be caught by the catch block, leading to an incorrect ExceptionFailure
-          // for the task.
-          throw new TaskKilledException
-        }
+        val taskSerializedSize = remainingBytes.getInt
+        remainingBytes.limit(remainingBytes.position() + taskSerializedSize)
+        task = ser.deserialize[Task[Any]](remainingBytes, Thread.currentThread.getContextClassLoader)
 
-        attemptedTask = Some(task)
-        logDebug("Task " + taskId + "'s epoch is " + task.epoch)
-        env.mapOutputTracker.updateEpoch(task.epoch)
+        remainingBytes.limit(remainingBytes.capacity())
+        val dynamicVariableSerializedSize = remainingBytes.getInt
+        remainingBytes.limit(remainingBytes.position() + dynamicVariableSerializedSize)
+        SparkDynamic.withValue(deserializeDynamicValue(remainingBytes, ser)) {
 
-        // Run the actual task and measure its runtime.
-        taskStart = System.currentTimeMillis()
-        val value = task.run(taskId.toInt)
-        val taskFinish = System.currentTimeMillis()
-
-        // If the task has been killed, let's fail it.
-        if (task.killed) {
-          throw new TaskKilledException
-        }
-
-        val resultSer = SparkEnv.get.serializer.newInstance()
-        val beforeSerialization = System.currentTimeMillis()
-        val valueBytes = resultSer.serialize(value)
-        val afterSerialization = System.currentTimeMillis()
-
-        for (m <- task.metrics) {
-          m.hostname = Utils.localHostName()
-          m.executorDeserializeTime = taskStart - startTime
-          m.executorRunTime = taskFinish - taskStart
-          m.jvmGCTime = gcTime - startGCTime
-          m.resultSerializationTime = afterSerialization - beforeSerialization
-        }
-
-        val accumUpdates = Accumulators.values
-
-        val directResult = new DirectTaskResult(valueBytes, accumUpdates,
-          task.metrics.getOrElse(null))
-        val serializedDirectResult = ser.serialize(directResult)
-        logInfo("Serialized size of result for " + taskId + " is " + serializedDirectResult.limit)
-        val serializedResult = {
-          if (serializedDirectResult.limit >= akkaFrameSize - AkkaUtils.reservedSizeBytes) {
-            logInfo("Storing result for " + taskId + " in local BlockManager")
-            val blockId = TaskResultBlockId(taskId)
-            env.blockManager.putBytes(
-              blockId, serializedDirectResult, StorageLevel.MEMORY_AND_DISK_SER)
-            ser.serialize(new IndirectTaskResult[Any](blockId))
-          } else {
-            logInfo("Sending result for " + taskId + " directly to driver")
-            serializedDirectResult
+          // If this task has been killed before we deserialized it, let's quit now. Otherwise,
+          // continue executing the task.
+          if (killed) {
+            // Throw an exception rather than returning, because returning within a try{} block
+            // causes a NonLocalReturnControl exception to be thrown. The NonLocalReturnControl
+            // exception will be caught by the catch block, leading to an incorrect ExceptionFailure
+            // for the task.
+            throw new TaskKilledException
           }
-        }
 
-        execBackend.statusUpdate(taskId, TaskState.FINISHED, serializedResult)
-        logInfo("Finished task ID " + taskId)
+          attemptedTask = Some(task)
+          logDebug("Task " + taskId + "'s epoch is " + task.epoch)
+          env.mapOutputTracker.updateEpoch(task.epoch)
+
+          // Run the actual task and measure its runtime.
+          taskStart = System.currentTimeMillis()
+          val value = task.run(taskId.toInt)
+          val taskFinish = System.currentTimeMillis()
+
+          // If the task has been killed, let's fail it.
+          if (task.killed) {
+            throw new TaskKilledException
+          }
+
+          val resultSer = SparkEnv.get.serializer.newInstance()
+          val beforeSerialization = System.currentTimeMillis()
+          val valueBytes = resultSer.serialize(value)
+          val afterSerialization = System.currentTimeMillis()
+
+          for (m <- task.metrics) {
+            m.hostname = Utils.localHostName()
+            m.executorDeserializeTime = taskStart - startTime
+            m.executorRunTime = taskFinish - taskStart
+            m.jvmGCTime = gcTime - startGCTime
+            m.resultSerializationTime = afterSerialization - beforeSerialization
+          }
+
+          val accumUpdates = Accumulators.values
+
+          val directResult = new DirectTaskResult(valueBytes, accumUpdates,
+            task.metrics.getOrElse(null))
+          val serializedDirectResult = ser.serialize(directResult)
+          logInfo("Serialized size of result for " + taskId + " is " + serializedDirectResult.limit)
+          val serializedResult = {
+            if (serializedDirectResult.limit >= akkaFrameSize - AkkaUtils.reservedSizeBytes) {
+              logInfo("Storing result for " + taskId + " in local BlockManager")
+              val blockId = TaskResultBlockId(taskId)
+              env.blockManager.putBytes(
+                blockId, serializedDirectResult, StorageLevel.MEMORY_AND_DISK_SER)
+              ser.serialize(new IndirectTaskResult[Any](blockId))
+            } else {
+              logInfo("Sending result for " + taskId + " directly to driver")
+              serializedDirectResult
+            }
+          }
+
+          execBackend.statusUpdate(taskId, TaskState.FINISHED, serializedResult)
+          logInfo("Finished task ID " + taskId)
+
+        }
       } catch {
         case ffe: FetchFailedException => {
           val reason = ffe.toTaskEndReason
@@ -266,6 +277,15 @@ private[spark] class Executor(
         }
         runningTasks.remove(taskId)
       }
+    }
+  }
+
+  private def deserializeDynamicValue(serializedData: ByteBuffer, ser: SerializerInstance): Option[Any] = {
+    if (serializedData.hasRemaining) {
+      Some(ser.deserialize[Any](serializedData, Thread.currentThread.getContextClassLoader))
+    }
+    else {
+      None
     }
   }
 

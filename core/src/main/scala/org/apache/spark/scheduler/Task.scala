@@ -22,7 +22,7 @@ import java.nio.ByteBuffer
 
 import scala.collection.mutable.HashMap
 
-import org.apache.spark.TaskContext
+import org.apache.spark.{SparkDynamic, TaskContext}
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.serializer.SerializerInstance
 import org.apache.spark.util.ByteBufferInputStream
@@ -107,6 +107,7 @@ private[spark] object Task {
       task: Task[_],
       currentFiles: HashMap[String, Long],
       currentJars: HashMap[String, Long],
+      dynamicVariableValue: Option[Any],
       serializer: SerializerInstance)
     : ByteBuffer = {
 
@@ -127,11 +128,27 @@ private[spark] object Task {
       dataOut.writeLong(timestamp)
     }
 
-    // Write the task itself and finish
-    dataOut.flush()
+    // Write the task itself
     val taskBytes = serializer.serialize(task).array()
+    dataOut.writeInt(taskBytes.size)
+    dataOut.flush()
     out.write(taskBytes)
+
+    // Write the dynamic variable
+    val dynamicVariableBytes = {
+      if (dynamicVariableValue.isDefined) {
+        serializer.serialize(dynamicVariableValue.get).array()
+      }
+      else {
+        new Array[Byte](0)
+      }
+    }
+    dataOut.writeInt(dynamicVariableBytes.length)
+    dataOut.flush()
+    out.write(dynamicVariableBytes)
+
     ByteBuffer.wrap(out.toByteArray)
+
   }
 
   /**
@@ -162,6 +179,7 @@ private[spark] object Task {
     }
 
     // Create a sub-buffer for the rest of the data, which is the serialized Task object
+    // and also the dynamic variable
     val subBuffer = serializedTask.slice()  // ByteBufferInputStream will have read just up to task
     (taskFiles, taskJars, subBuffer)
   }

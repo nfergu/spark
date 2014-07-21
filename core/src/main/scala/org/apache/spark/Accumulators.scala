@@ -204,7 +204,7 @@ GrowableAccumulableParam[R <% Growable[T] with TraversableOnce[T] with Serializa
  * The interpreter session below shows an accumulator being used to add up the elements of an array:
  *
  * {{{
- * scala> val accum = sc.accumulator(0)
+s * scala> val accum = sc.accumulator(0)
  * accum: spark.Accumulator[Int] = 0
  *
  * scala> sc.parallelize(Array(1, 2, 3, 4)).foreach(x => accum += x)

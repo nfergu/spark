@@ -26,6 +26,7 @@ import scala.collection.mutable.HashMap
 
 import org.apache.spark._
 import org.apache.spark.rdd.{RDD, RDDCheckpointData}
+import scala.util.DynamicVariable
 
 private[spark] object ResultTask {
 
@@ -146,5 +147,6 @@ private[spark] class ResultTask[T, U](
     outputId = in.readInt()
     epoch = in.readLong()
     split = in.readObject().asInstanceOf[Partition]
+
   }
 }
